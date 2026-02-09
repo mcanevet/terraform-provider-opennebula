@@ -1305,3 +1305,110 @@ resource "opennebula_virtual_machine" "test" {
 	sched_requirements = "CLUSTER_ID!=\"123\""
 }
 `
+
+func TestAccVirtualMachineWithContextWo(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckVirtualMachineDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccVirtualMachineTemplateConfigContextWo,
+				Check: resource.ComposeTestCheckFunc(
+					testAccSetDSdummy(),
+					resource.TestCheckResourceAttr("opennebula_virtual_machine.test", "name", "test-virtual_machine-contextwo"),
+					resource.TestCheckResourceAttr("opennebula_virtual_machine.test", "memory", "128"),
+					resource.TestCheckResourceAttr("opennebula_virtual_machine.test", "cpu", "0.1"),
+					// Regular context should be in state
+					resource.TestCheckResourceAttr("opennebula_virtual_machine.test", "context.%", "2"),
+					resource.TestCheckResourceAttr("opennebula_virtual_machine.test", "context.NETWORK", "YES"),
+					resource.TestCheckResourceAttr("opennebula_virtual_machine.test", "context.HOSTNAME", "test-vm"),
+					// WriteOnly context_wo should NOT be in state
+					resource.TestCheckNoResourceAttr("opennebula_virtual_machine.test", "context_wo"),
+					// Verify the VM has both context and context_wo values applied
+					testAccCheckVMContextVariables("opennebula_virtual_machine.test", map[string]string{
+						"NETWORK":  "YES",
+						"HOSTNAME": "test-vm",
+						"API_KEY":  "secret-api-key",
+						"PASSWORD": "secret-password",
+					}),
+				),
+			},
+		},
+	})
+}
+
+// testAccCheckVMContextVariables verifies that a VM has the expected context variables.
+// This is used to test WriteOnly context_wo values which are not stored in state.
+func testAccCheckVMContextVariables(resourceName string, expected map[string]string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[resourceName]
+		if !ok {
+			return fmt.Errorf("Not found: %s", resourceName)
+		}
+
+		config := testAccProvider.Meta().(*Configuration)
+		controller := config.Controller
+
+		vmID, err := strconv.ParseUint(rs.Primary.ID, 10, 0)
+		if err != nil {
+			return fmt.Errorf("Failed to parse VM ID: %s", err)
+		}
+
+		vmInfo, err := controller.VM(int(vmID)).Info(false)
+		if err != nil {
+			return fmt.Errorf("Failed to get VM info: %s", err)
+		}
+
+		// Check each expected context variable
+		for key, expectedValue := range expected {
+			actualValue, err := vmInfo.Template.GetStr(key)
+			if err != nil {
+				return fmt.Errorf("Context variable %s not found in VM: %s", key, err)
+			}
+			if actualValue != expectedValue {
+				return fmt.Errorf("Context variable %s: expected '%s', got '%s'", key, expectedValue, actualValue)
+			}
+		}
+
+		return nil
+	}
+}
+
+var testAccVirtualMachineTemplateConfigContextWo = `
+resource "opennebula_virtual_machine" "test" {
+  name        = "test-virtual_machine-contextwo"
+  group       = "oneadmin"
+  permissions = "642"
+  memory = 128
+  cpu = 0.1
+  description = "VM created for testing context_wo"
+
+  context = {
+	NETWORK  = "YES"
+	HOSTNAME = "test-vm"
+  }
+
+  context_wo = {
+	API_KEY  = "secret-api-key"
+	PASSWORD = "secret-password"
+  }
+
+  graphics {
+    type   = "VNC"
+    listen = "0.0.0.0"
+    keymap = "en-us"
+  }
+
+  os {
+    arch = "x86_64"
+    boot = ""
+  }
+
+  tags = {
+    env = "test"
+  }
+
+  timeout = 5
+}
+`

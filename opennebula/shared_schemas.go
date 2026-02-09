@@ -86,14 +86,16 @@ func commonVMSchemas() map[string]*schema.Schema {
 
 func commonInstanceSchema() map[string]*schema.Schema {
 	return map[string]*schema.Schema{
-		"cpu":      cpuSchema(),
-		"vcpu":     vcpuSchema(),
-		"memory":   memorySchema(),
-		"context":  contextSchema(),
-		"cpumodel": cpumodelSchema(),
-		"graphics": graphicsSchema(),
-		"os":       osSchema(),
-		"vmgroup":  vmGroupSchema(),
+		"cpu":            cpuSchema(),
+		"vcpu":           vcpuSchema(),
+		"memory":         memorySchema(),
+		"context":        contextSchema(),
+		"context_wo":     contextWoSchema(),
+		"context_wo_hash": contextWoHashSchema(),
+		"cpumodel":       cpumodelSchema(),
+		"graphics":   graphicsSchema(),
+		"os":         osSchema(),
+		"vmgroup":    vmGroupSchema(),
 		"raw": {
 			Type:        schema.TypeList,
 			Optional:    true,
@@ -408,6 +410,27 @@ func contextSchema() *schema.Schema {
 		Type:        schema.TypeMap,
 		Optional:    true,
 		Description: "Context variables",
+	}
+}
+
+// contextWoSchema defines the write-only context variables schema.
+// WriteOnly attributes are never persisted in Terraform state, making them
+// suitable for sensitive data from ephemeral providers (e.g., Vault, AWS Secrets Manager).
+// Values from context_wo are merged with regular context during VM operations.
+func contextWoSchema() *schema.Schema {
+	return &schema.Schema{
+		Type:        schema.TypeMap,
+		Optional:    true,
+		WriteOnly:   true,
+		Description: "Context variables (write-only, for ephemeral resources like secrets). These values are passed to the VM but never stored in Terraform state. Changes are automatically detected via hash comparison.",
+	}
+}
+
+func contextWoHashSchema() *schema.Schema {
+	return &schema.Schema{
+		Type:        schema.TypeString,
+		Computed:    true,
+		Description: "Internal hash of context_wo for automatic change detection. Computed by the provider.",
 	}
 }
 

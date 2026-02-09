@@ -102,6 +102,7 @@ The following arguments are supported:
 * `vpcu` - (Optional) Number of CPU cores presented to the VM.
 * `memory` - (Optional) Amount of RAM assigned to the VM in MB. **Mandatory if** `template_id` **is not set**.
 * `context` - (Optional) Array of free form key=value pairs, rendered and added to the CONTEXT variables for the VM. Recommended to include: `NETWORK = "YES"` and `SET_HOSTNAME = "$NAME"`. If a `template_id` is set, see [Instantiate from a template](#instantiate-from-a-template) for details.
+* `context_wo` - (Optional) Write-only context variables for sensitive data that should not be persisted in Terraform state. Similar to `context`, but these values are never stored in state, making them suitable for ephemeral resources like secrets from Vault or other secrets managers. Values from `context_wo` are merged with `context` when creating or updating the VM. If the same key exists in both, `context_wo` takes precedence. Changes are automatically detected via internal hash comparison. See [Using write-only context for secrets](#using-write-only-context-for-secrets) below for examples.
 * `graphics` - (Optional) See [Graphics parameters](#graphics-parameters) below for details.
 * `os` - (Optional) See [OS parameters](#os-parameters) below for details.
 * `disk` - (Optional) Can be specified multiple times to attach several disks. See [Disk parameters](#disk-parameters) below for details.
@@ -350,6 +351,91 @@ The following attribute are exported:
 * `computed_target` - Target name device on the virtual machine. Depends of the image `dev_prefix`.
 * `computed_driver` - OpenNebula image driver.
 * `computed_volatile_format` - Format of the Image: `raw` or `qcow2`.
+
+## Using write-only context for secrets
+
+The `context_wo` attribute allows you to pass sensitive data to VMs without persisting it in Terraform state. This is useful when integrating with secrets managers like Vault, AWS Secrets Manager, or when using ephemeral resources.
+
+Values from `context_wo` are merged with regular `context` variables and passed to the VM. However, unlike `context`, these values are never stored in the Terraform state file, enhancing security for sensitive data.
+
+### Example with Vault integration
+
+```hcl
+# Fetch secrets from Vault
+data "vault_generic_secret" "db_password" {
+  path = "secret/database"
+}
+
+resource "opennebula_virtual_machine" "app_server" {
+  name   = "app-server"
+  cpu    = 2
+  memory = 2048
+
+  # Regular context variables (stored in state)
+  context = {
+    NETWORK  = "YES"
+    HOSTNAME = "$NAME"
+    APP_ENV  = "production"
+  }
+
+  # Sensitive context variables (NOT stored in state)
+  context_wo = {
+    DB_PASSWORD = data.vault_generic_secret.db_password.data["password"]
+    API_KEY     = var.sensitive_api_key
+  }
+
+  disk {
+    image_id = var.os_image_id
+  }
+
+  nic {
+    network_id = var.network_id
+  }
+}
+```
+
+### Example with random passwords
+
+```hcl
+resource "random_password" "vm_password" {
+  length  = 16
+  special = true
+}
+
+resource "opennebula_virtual_machine" "secure_vm" {
+  name   = "secure-vm"
+  cpu    = 1
+  memory = 1024
+
+  context = {
+    NETWORK  = "YES"
+    USERNAME = "admin"
+  }
+
+  # The password is passed to the VM but never stored in state
+  context_wo = {
+    PASSWORD = random_password.vm_password.result
+  }
+
+  disk {
+    image_id = var.os_image_id
+  }
+
+  nic {
+    network_id = var.network_id
+  }
+}
+```
+
+### Important notes
+
+* Values in `context_wo` are write-only and cannot be read or imported
+* If the same key exists in both `context` and `context_wo`, the value from `context_wo` takes precedence
+* All context keys are automatically uppercased to match OpenNebula's CONTEXT behavior
+* **Changes to `context_wo` are automatically detected** - the provider computes an internal hash to track changes, enabling idempotent behavior without user intervention
+* When `context_wo` values change, the VM's CONTEXT will be updated on the next `terraform apply`
+* The hash is stored in state as a computed attribute (`context_wo_hash`) for change detection
+* No manual version management required - it just works!
 
 ## Instantiate from a template
 

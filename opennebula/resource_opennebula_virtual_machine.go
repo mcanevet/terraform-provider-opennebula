@@ -2,6 +2,8 @@ package opennebula
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"sort"
@@ -9,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/go-cty/cty"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 
@@ -545,6 +548,7 @@ func resourceOpennebulaVirtualMachineCreate(ctx context.Context, d *schema.Resou
 	}
 
 	d.SetId(fmt.Sprintf("%v", vmID))
+
 	vmc := controller.VM(vmID)
 
 	final := NewVMLCMState(vm.Running)
@@ -692,6 +696,13 @@ func resourceOpennebulaVirtualMachineCreate(ctx context.Context, d *schema.Resou
 	d.Set("template_nic", []interface{}{})
 	d.Set("template_disk", []interface{}{})
 	d.Set("template_nic_alias", []interface{}{})
+
+	// Store initial context_wo hash for future change detection
+	// Retrieve context_wo again since we need it at the end of CREATE
+	contextWo := getContextWo(d)
+	if err := d.Set("context_wo_hash", computeContextWoHash(contextWo)); err != nil {
+		log.Printf("[WARN] Failed to set context_wo_hash: %s", err)
+	}
 
 	return resourceOpennebulaVirtualMachineRead(ctx, d, meta)
 }
@@ -2092,7 +2103,23 @@ func resourceOpennebulaVirtualMachineUpdateCustom(ctx context.Context, d *schema
 		}
 	}
 
-	if d.HasChange("context") {
+	// Check if context has changed
+	contextChanged := d.HasChange("context")
+
+	// Retrieve write-only context_wo values from raw config.
+	// These values are never in state, so we must fetch them from the config.
+	// Per HashiCorp SDKv2 docs, write-only arguments should not trigger updates by themselves.
+	// They are included when context is updated, but don't cause perpetual diffs.
+	contextWo := getContextWo(d)
+
+	// Compute current hash of context_wo to detect changes
+	currentHash := computeContextWoHash(contextWo)
+	previousHash := d.Get("context_wo_hash").(string)
+	contextWoChanged := currentHash != previousHash
+
+	// Update context when regular context or context_wo hash has changed.
+	// Write-only context_wo values are automatically tracked via hash comparison.
+	if contextChanged || contextWoChanged {
 
 		updateConf = true
 
@@ -2102,7 +2129,7 @@ func resourceOpennebulaVirtualMachineUpdateCustom(ctx context.Context, d *schema
 		appliedContext := old.(map[string]interface{})
 		newContext := new.(map[string]interface{})
 
-		if len(newContext) == 0 {
+		if len(newContext) == 0 && len(contextWo) == 0 {
 			// No context configuration to apply
 			tpl.Del(vmk.ContextVec)
 		} else {
@@ -2124,8 +2151,34 @@ func resourceOpennebulaVirtualMachineUpdateCustom(ctx context.Context, d *schema
 					contextVec.AddPair(keyUp, value)
 				}
 
+				// Add new write-only elements (always applied, no prior state)
+				for key, value := range contextWo {
+					keyUp := strings.ToUpper(key)
+					contextVec.AddPair(keyUp, value)
+				}
+
 			} else {
-				updateVMTemplateVec(tpl, "CONTEXT", appliedContext, newContext)
+				// Merge both context maps for update
+				// Keys are uppercased to match OpenNebula CONTEXT behavior
+				// Note: context_wo has no prior state (WriteOnly), so only context is in appliedContext
+				// If the same key exists in both context and context_wo, context_wo takes precedence
+				mergedApplied := make(map[string]interface{})
+				mergedNew := make(map[string]interface{})
+
+				// Only include regular context in applied (context_wo has no state history)
+				for k, v := range appliedContext {
+					mergedApplied[strings.ToUpper(k)] = v
+				}
+
+				// Include both context and context_wo in new config
+				for k, v := range newContext {
+					mergedNew[strings.ToUpper(k)] = v
+				}
+				for k, v := range contextWo {
+					mergedNew[strings.ToUpper(k)] = v
+				}
+
+				updateVMTemplateVec(tpl, "CONTEXT", mergedApplied, mergedNew)
 				if err != nil {
 					diags = append(diags, diag.Diagnostic{
 						Severity: diag.Error,
@@ -2135,6 +2188,16 @@ func resourceOpennebulaVirtualMachineUpdateCustom(ctx context.Context, d *schema
 					return diags
 				}
 			}
+		}
+
+		// Store the new hash in state for future change detection
+		// This enables automatic detection of context_wo changes without user intervention
+		if err := d.Set("context_wo_hash", currentHash); err != nil {
+			diags = append(diags, diag.Diagnostic{
+				Severity: diag.Warning,
+				Summary:  "Failed to set context_wo_hash",
+				Detail:   fmt.Sprintf("virtual machine (ID: %s): %s", d.Id(), err),
+			})
 		}
 	}
 
@@ -3048,7 +3111,73 @@ func attachNicAliasList(ctx context.Context, vmc *goca.VMController, nicAliasLis
 	return nil
 }
 
-// updateVMVec update a vector of an existing VM template
+// getContextWo retrieves write-only context variables from the raw Terraform configuration.
+//
+// WriteOnly attributes are never stored in state and cannot be accessed via d.Get().
+// Instead, they must be retrieved from the raw config using GetRawConfigAt().
+//
+// This allows sensitive values (e.g., credentials from Vault) to be passed to VMs
+// without persisting them in the Terraform state file.
+//
+// See: https://developer.hashicorp.com/terraform/plugin/sdkv2/resources/write-only-arguments
+func getContextWo(d *schema.ResourceData) map[string]interface{} {
+	contextWo := make(map[string]interface{})
+
+	// Retrieve the raw config value for context_wo using cty.Path
+	contextWoVal, diags := d.GetRawConfigAt(cty.GetAttrPath("context_wo"))
+	if diags.HasError() || contextWoVal.IsNull() || !contextWoVal.IsKnown() {
+		return contextWo
+	}
+
+	// Convert cty.Value map to Go map[string]interface{}
+	// ForEachElement iterates over all key-value pairs in the context_wo map
+	contextWoVal.ForEachElement(func(key cty.Value, val cty.Value) (stop bool) {
+		if key.Type() == cty.String && val.Type() == cty.String {
+			contextWo[key.AsString()] = val.AsString()
+		}
+		return false
+	})
+
+	return contextWo
+}
+
+// computeContextWoHash computes a deterministic SHA256 hash of context_wo values.
+// This hash is stored in state to automatically detect when context_wo values change,
+// enabling idempotent behavior without requiring a user-managed version attribute.
+//
+// The hash is computed by:
+// 1. Sorting keys alphabetically for consistency
+// 2. Concatenating key=value pairs
+// 3. Computing SHA256 hash of the result
+//
+// Returns empty string if context_wo is empty.
+func computeContextWoHash(contextWo map[string]interface{}) string {
+	if len(contextWo) == 0 {
+		return ""
+	}
+
+	// Sort keys for deterministic hashing
+	keys := make([]string, 0, len(contextWo))
+	for k := range contextWo {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Build deterministic string representation
+	var sb strings.Builder
+	for _, k := range keys {
+		sb.WriteString(k)
+		sb.WriteString("=")
+		sb.WriteString(fmt.Sprintf("%v", contextWo[k]))
+		sb.WriteString(";")
+	}
+
+	// Compute SHA256 hash
+	hash := sha256.Sum256([]byte(sb.String()))
+	return hex.EncodeToString(hash[:])
+}
+
+// updateVMTemplateVec update a vector of an existing VM template
 func updateVMTemplateVec(tpl *vm.Template, vecName string, appliedCfg, newCfg map[string]interface{}) error {
 
 	// Retrieve vector
@@ -3231,10 +3360,18 @@ func generateVm(d *schema.ResourceData, meta interface{}, templateContent *vm.Te
 		tpl.Add(vmk.Name, d.Get("name").(string))
 	}
 
-	//Generate CONTEXT definition
+	// Generate CONTEXT definition by merging regular context with write-only context_wo.
+	// context: Regular context variables that are persisted in Terraform state
 	context := d.Get("context").(map[string]interface{})
 	log.Printf("Number of CONTEXT vars: %d", len(context))
 	log.Printf("CONTEXT Map: %s", context)
+
+	// context_wo: Write-only context variables for ephemeral/sensitive data (e.g., Vault secrets).
+	// These values are never persisted in state and must be retrieved from raw config.
+	// Both context and context_wo are merged together and applied to the VM's CONTEXT.
+	contextWo := getContextWo(d)
+	log.Printf("Number of CONTEXT_WO vars: %d", len(contextWo))
+	log.Printf("CONTEXT_WO Map: %s", contextWo)
 
 	var tplContext *dyn.Vector
 	if templateContent != nil {
@@ -3253,11 +3390,24 @@ func generateVm(d *schema.ResourceData, meta interface{}, templateContent *vm.Te
 			tplContext.AddPair(keyUp, value)
 		}
 
+		// Add write-only context variables
+		for key, value := range contextWo {
+			keyUp := strings.ToUpper(key)
+			tplContext.Del(keyUp)
+			tplContext.AddPair(keyUp, value)
+		}
+
 		tpl.Elements = append(tpl.Elements, tplContext)
 	} else {
 
 		// Add new context elements to the template
 		for key, value := range context {
+			keyUp := strings.ToUpper(key)
+			tpl.AddCtx(vmk.Context(keyUp), fmt.Sprint(value))
+		}
+
+		// Add write-only context elements to the template
+		for key, value := range contextWo {
 			keyUp := strings.ToUpper(key)
 			tpl.AddCtx(vmk.Context(keyUp), fmt.Sprint(value))
 		}
