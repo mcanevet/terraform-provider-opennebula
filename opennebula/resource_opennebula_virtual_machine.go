@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/go-cty/cty"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 
@@ -545,6 +546,7 @@ func resourceOpennebulaVirtualMachineCreate(ctx context.Context, d *schema.Resou
 	}
 
 	d.SetId(fmt.Sprintf("%v", vmID))
+
 	vmc := controller.VM(vmID)
 
 	final := NewVMLCMState(vm.Running)
@@ -2092,7 +2094,14 @@ func resourceOpennebulaVirtualMachineUpdateCustom(ctx context.Context, d *schema
 		}
 	}
 
-	if d.HasChange("context") {
+	// Check if context has changed
+	contextChanged := d.HasChange("context")
+
+	// For write-only context_wo, check if it's present in the config
+	// WriteOnly attributes must be retrieved from raw config
+	contextWo := getContextWo(d)
+
+	if contextChanged || len(contextWo) > 0 {
 
 		updateConf = true
 
@@ -2102,7 +2111,7 @@ func resourceOpennebulaVirtualMachineUpdateCustom(ctx context.Context, d *schema
 		appliedContext := old.(map[string]interface{})
 		newContext := new.(map[string]interface{})
 
-		if len(newContext) == 0 {
+		if len(newContext) == 0 && len(contextWo) == 0 {
 			// No context configuration to apply
 			tpl.Del(vmk.ContextVec)
 		} else {
@@ -2124,8 +2133,34 @@ func resourceOpennebulaVirtualMachineUpdateCustom(ctx context.Context, d *schema
 					contextVec.AddPair(keyUp, value)
 				}
 
+				// Add new write-only elements (always applied, no prior state)
+				for key, value := range contextWo {
+					keyUp := strings.ToUpper(key)
+					contextVec.AddPair(keyUp, value)
+				}
+
 			} else {
-				updateVMTemplateVec(tpl, "CONTEXT", appliedContext, newContext)
+				// Merge both context maps for update
+				// Keys are uppercased to match OpenNebula CONTEXT behavior
+				// Note: context_wo has no prior state (WriteOnly), so only context is in appliedContext
+				// If the same key exists in both context and context_wo, context_wo takes precedence
+				mergedApplied := make(map[string]interface{})
+				mergedNew := make(map[string]interface{})
+
+				// Only include regular context in applied (context_wo has no state history)
+				for k, v := range appliedContext {
+					mergedApplied[strings.ToUpper(k)] = v
+				}
+
+				// Include both context and context_wo in new config
+				for k, v := range newContext {
+					mergedNew[strings.ToUpper(k)] = v
+				}
+				for k, v := range contextWo {
+					mergedNew[strings.ToUpper(k)] = v
+				}
+
+				updateVMTemplateVec(tpl, "CONTEXT", mergedApplied, mergedNew)
 				if err != nil {
 					diags = append(diags, diag.Diagnostic{
 						Severity: diag.Error,
@@ -3048,7 +3083,30 @@ func attachNicAliasList(ctx context.Context, vmc *goca.VMController, nicAliasLis
 	return nil
 }
 
-// updateVMVec update a vector of an existing VM template
+// getContextWo retrieves write-only context variables from raw config
+// WriteOnly attributes are not available via d.Get(), must use GetRawConfigAt()
+// See: https://developer.hashicorp.com/terraform/plugin/sdkv2/resources/write-only-arguments
+func getContextWo(d *schema.ResourceData) map[string]interface{} {
+	contextWo := make(map[string]interface{})
+
+	// Use GetRawConfigAt with cty.Path as recommended by HashiCorp
+	contextWoVal, diags := d.GetRawConfigAt(cty.GetAttrPath("context_wo"))
+	if diags.HasError() || contextWoVal.IsNull() || !contextWoVal.IsKnown() {
+		return contextWo
+	}
+
+	// Convert cty.Value map to map[string]interface{}
+	contextWoVal.ForEachElement(func(key cty.Value, val cty.Value) (stop bool) {
+		if key.Type() == cty.String && val.Type() == cty.String {
+			contextWo[key.AsString()] = val.AsString()
+		}
+		return false
+	})
+
+	return contextWo
+}
+
+// updateVMTemplateVec update a vector of an existing VM template
 func updateVMTemplateVec(tpl *vm.Template, vecName string, appliedCfg, newCfg map[string]interface{}) error {
 
 	// Retrieve vector
@@ -3236,6 +3294,12 @@ func generateVm(d *schema.ResourceData, meta interface{}, templateContent *vm.Te
 	log.Printf("Number of CONTEXT vars: %d", len(context))
 	log.Printf("CONTEXT Map: %s", context)
 
+	// Get write-only context (for ephemeral resources)
+	// WriteOnly attributes must be retrieved from raw config
+	contextWo := getContextWo(d)
+	log.Printf("Number of CONTEXT_WO vars: %d", len(contextWo))
+	log.Printf("CONTEXT_WO Map: %s", contextWo)
+
 	var tplContext *dyn.Vector
 	if templateContent != nil {
 		tplContext, _ = templateContent.GetVector(vmk.ContextVec)
@@ -3253,11 +3317,24 @@ func generateVm(d *schema.ResourceData, meta interface{}, templateContent *vm.Te
 			tplContext.AddPair(keyUp, value)
 		}
 
+		// Add write-only context variables
+		for key, value := range contextWo {
+			keyUp := strings.ToUpper(key)
+			tplContext.Del(keyUp)
+			tplContext.AddPair(keyUp, value)
+		}
+
 		tpl.Elements = append(tpl.Elements, tplContext)
 	} else {
 
 		// Add new context elements to the template
 		for key, value := range context {
+			keyUp := strings.ToUpper(key)
+			tpl.AddCtx(vmk.Context(keyUp), fmt.Sprint(value))
+		}
+
+		// Add write-only context elements to the template
+		for key, value := range contextWo {
 			keyUp := strings.ToUpper(key)
 			tpl.AddCtx(vmk.Context(keyUp), fmt.Sprint(value))
 		}

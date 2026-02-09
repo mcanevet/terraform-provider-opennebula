@@ -86,10 +86,11 @@ func commonVMSchemas() map[string]*schema.Schema {
 
 func commonInstanceSchema() map[string]*schema.Schema {
 	return map[string]*schema.Schema{
-		"cpu":      cpuSchema(),
-		"vcpu":     vcpuSchema(),
-		"memory":   memorySchema(),
-		"context":  contextSchema(),
+		"cpu":     cpuSchema(),
+		"vcpu":    vcpuSchema(),
+		"memory":  memorySchema(),
+		"context": contextSchema(),
+		"context_wo": contextWoSchema(),
 		"cpumodel": cpumodelSchema(),
 		"graphics": graphicsSchema(),
 		"os":       osSchema(),
@@ -408,6 +409,15 @@ func contextSchema() *schema.Schema {
 		Type:        schema.TypeMap,
 		Optional:    true,
 		Description: "Context variables",
+	}
+}
+
+func contextWoSchema() *schema.Schema {
+	return &schema.Schema{
+		Type:        schema.TypeMap,
+		Optional:    true,
+		WriteOnly:   true,
+		Description: "Context variables (write-only, for ephemeral resources)",
 	}
 }
 
