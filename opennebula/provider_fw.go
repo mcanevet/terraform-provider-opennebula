@@ -2,7 +2,12 @@ package opennebula
 
 import (
 	"context"
+	"crypto/tls"
+	"log"
+	"net/http"
 
+	"github.com/OpenNebula/one/src/oca/go/src/goca"
+	ver "github.com/hashicorp/go-version"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
@@ -81,31 +86,90 @@ func (p *frameworkProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 func (p *frameworkProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
 	// Retrieve provider data from configuration
 	var config frameworkProviderModel
-	diags := req.Config.Get(ctx, &config)
-	resp.Diagnostics.Append(diags...)
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	// TODO: Initialize OpenNebula client configuration
-	// For now, we'll leave this empty until we migrate actual resources
-	// The SDKv2 provider will continue handling all resources
+	// Validate required fields
+	if config.Username.IsNull() {
+		resp.Diagnostics.AddError("Missing username", "username should be defined")
+		return
+	}
+	if config.Password.IsNull() {
+		resp.Diagnostics.AddError("Missing password", "password should be defined")
+		return
+	}
+	if config.Endpoint.IsNull() {
+		resp.Diagnostics.AddError("Missing endpoint", "endpoint should be defined")
+		return
+	}
 
-	// Example configuration would look like:
-	// client, err := goca.NewClient(...)
-	// if err != nil {
-	//     resp.Diagnostics.AddError("Unable to Create OpenNebula API Client", err.Error())
-	//     return
-	// }
-	// resp.DataSourceData = client
-	// resp.ResourceData = client
+	// Extract configuration values
+	username := config.Username.ValueString()
+	password := config.Password.ValueString()
+	endpoint := config.Endpoint.ValueString()
+	insecure := config.Insecure.ValueBool()
+
+	// Setup HTTP transport with TLS configuration
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
+	}
+
+	// Create OpenNebula client
+	oneClient := goca.NewClient(
+		goca.NewConfig(username, password, endpoint),
+		&http.Client{Transport: tr},
+	)
+
+	// Get OpenNebula version
+	versionStr, err := goca.NewController(oneClient).SystemVersion()
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Failed to get OpenNebula release number",
+			err.Error(),
+		)
+		return
+	}
+
+	version, err := ver.NewVersion(versionStr)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Failed to parse OpenNebula version",
+			err.Error(),
+		)
+		return
+	}
+
+	log.Printf("[INFO] OpenNebula version: %s", versionStr)
+
+	// Create configuration struct
+	cfg := &Configuration{
+		OneVersion: version,
+		mutex:      *NewMutexKV(),
+	}
+
+	// Setup Flow client if flow_endpoint is provided
+	if !config.FlowEndpoint.IsNull() {
+		flowEndpoint := config.FlowEndpoint.ValueString()
+		flowClient := goca.NewFlowClient(
+			goca.NewFlowConfig(username, password, flowEndpoint),
+			&http.Client{Transport: tr},
+		)
+		cfg.Controller = goca.NewGenericController(oneClient, flowClient)
+	} else {
+		cfg.Controller = goca.NewController(oneClient)
+	}
+
+	// Make configuration available to data sources and resources
+	resp.DataSourceData = cfg
+	resp.ResourceData = cfg
 }
 
 // DataSources defines the data sources implemented in the provider.
 func (p *frameworkProvider) DataSources(_ context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{
-		// Data sources will be added here as they are migrated from SDKv2
-		// Example: NewTemplateDataSource,
+		NewZoneDataSource, // First migrated data source!
 	}
 }
 
