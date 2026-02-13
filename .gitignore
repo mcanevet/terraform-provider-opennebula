@@ -26,3 +26,5 @@ test.go
 *.tfstate*
 
 .vscode
+.vagrant/
+dist/
