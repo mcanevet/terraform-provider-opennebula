@@ -343,7 +343,15 @@ func resourceOpennebulaVirtualNetworkAddressRangeUpdate(ctx context.Context, d *
 	vNetworkID := d.Get("virtual_network_id").(int)
 	vnc := controller.VirtualNetwork(vNetworkID)
 
-	// release leases first, this allow us to update ARs without OpenNebula constraints
+	// AR recreation is required when ip4, ip6, or ar_type changes.
+	// Before freeing an AR, OpenNebula requires all leases (including held IPs)
+	// to be released. IPs being removed from hold_ips are released below;
+	// stable hold_ips (present in both old and new config) are tracked here so
+	// they can be temporarily released and then re-held after recreation.
+	// See: https://github.com/OpenNebula/terraform-provider-opennebula/issues/505
+	needsRecreation := d.HasChange("ar_type") || d.HasChange("ip4") || d.HasChange("ip6")
+	var ipToReHold []interface{}
+
 	if d.HasChange("hold_ips") {
 		oldIPs, newIPs := d.GetChange("hold_ips")
 
@@ -353,9 +361,8 @@ func resourceOpennebulaVirtualNetworkAddressRangeUpdate(ctx context.Context, d *
 		remIPs := oldIPsSet.Difference(newIPsSet).List()
 		addIPs = newIPsSet.Difference(oldIPsSet).List()
 
-		// release some old IPs
+		// release removed IPs
 		for _, ip := range remIPs {
-
 			err := ipRelease(vnc, ip.(string))
 			if err != nil {
 				diags = append(diags, diag.Diagnostic{
@@ -367,12 +374,45 @@ func resourceOpennebulaVirtualNetworkAddressRangeUpdate(ctx context.Context, d *
 			}
 		}
 
+		// If AR is being recreated, also release stable IPs so the AR can be freed
+		if needsRecreation {
+			for _, ip := range oldIPsSet.List() {
+				if newIPsSet.Contains(ip) {
+					err := ipRelease(vnc, ip.(string))
+					if err != nil {
+						diags = append(diags, diag.Diagnostic{
+							Severity: diag.Error,
+							Summary:  "Failed to release a lease on hold",
+							Detail:   fmt.Sprintf("virtual network (ID: %s): %s", d.Id(), err),
+						})
+						return diags
+					}
+					ipToReHold = append(ipToReHold, ip)
+				}
+			}
+		}
+
+	} else if needsRecreation {
+		// hold_ips unchanged: release all of them so the AR can be freed
+		if holdIPs, ok := d.GetOk("hold_ips"); ok {
+			for _, ip := range holdIPs.(*schema.Set).List() {
+				err := ipRelease(vnc, ip.(string))
+				if err != nil {
+					diags = append(diags, diag.Diagnostic{
+						Severity: diag.Error,
+						Summary:  "Failed to release a lease on hold",
+						Detail:   fmt.Sprintf("virtual network (ID: %s): %s", d.Id(), err),
+					})
+					return diags
+				}
+				ipToReHold = append(ipToReHold, ip)
+			}
+		}
 	}
 
-	// some attributes update require to detach - reattach the AR
+	// AR recreation for ar_type, ip4, ip6 changes
 	updated := false
-	if d.HasChange("ar_type") || d.HasChange("ip4") ||
-		d.HasChange("ip6") {
+	if needsRecreation {
 
 		arID, err := strconv.ParseUint(d.Id(), 10, 0)
 		if err != nil {
@@ -405,6 +445,7 @@ func resourceOpennebulaVirtualNetworkAddressRangeUpdate(ctx context.Context, d *
 			return diags
 		}
 		d.SetId(fmt.Sprintf("%d", newARID))
+		updated = true
 	}
 
 	// in-place updates
@@ -429,17 +470,27 @@ func resourceOpennebulaVirtualNetworkAddressRangeUpdate(ctx context.Context, d *
 
 	}
 
-	// holds leases
+	// Re-hold IPs that were temporarily released to allow AR recreation
+	for _, ip := range ipToReHold {
+		err := ipHold(vnc, ip.(string))
+		if err != nil {
+			diags = append(diags, diag.Diagnostic{
+				Severity: diag.Error,
+				Summary:  "Failed to hold a lease",
+				Detail:   fmt.Sprintf("virtual network (ID: %s): %s", d.Id(), err),
+			})
+			return diags
+		}
+	}
+
+	// hold new IPs from hold_ips change
 	if d.HasChange("hold_ips") {
-
-		// hold some new IPs
 		for _, ip := range addIPs {
-
 			err := ipHold(vnc, ip.(string))
 			if err != nil {
 				diags = append(diags, diag.Diagnostic{
 					Severity: diag.Error,
-					Summary:  "Failed to release a lease on hold",
+					Summary:  "Failed to hold a lease",
 					Detail:   fmt.Sprintf("virtual network (ID: %s): %s", d.Id(), err),
 				})
 				return diags
